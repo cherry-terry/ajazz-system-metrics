@@ -1,0 +1,126 @@
+{
+  "Actions": [
+    {
+      "Name": "CPU",
+      "UUID": "com.diy.metrics.cpu",
+      "Icon": "static/cpu.png",
+      "Tooltip": "Processor load, the same number Task Manager shows",
+      "States": [
+        {
+          "Image": "static/cpu.png",
+          "ShowTitle": false
+        }
+      ],
+      "Controllers": [
+        "Keypad"
+      ],
+      "SupportedInMultiActions": false,
+      "UserTitleEnabled": false,
+      "DisableAutomaticStates": true,
+      "PropertyInspectorPath": "propertyInspector/index.html"
+    },
+    {
+      "Name": "RAM",
+      "UUID": "com.diy.metrics.ram",
+      "Icon": "static/ram.png",
+      "Tooltip": "Memory in use",
+      "States": [
+        {
+          "Image": "static/ram.png",
+          "ShowTitle": false
+        }
+      ],
+      "Controllers": [
+        "Keypad"
+      ],
+      "SupportedInMultiActions": false,
+      "UserTitleEnabled": false,
+      "DisableAutomaticStates": true,
+      "PropertyInspectorPath": "propertyInspector/index.html"
+    },
+    {
+      "Name": "GPU",
+      "UUID": "com.diy.metrics.gpu",
+      "Icon": "static/gpu.png",
+      "Tooltip": "Graphics load",
+      "States": [
+        {
+          "Image": "static/gpu.png",
+          "ShowTitle": false
+        }
+      ],
+      "Controllers": [
+        "Keypad"
+      ],
+      "SupportedInMultiActions": false,
+      "UserTitleEnabled": false,
+      "DisableAutomaticStates": true,
+      "PropertyInspectorPath": "propertyInspector/index.html"
+    },
+    {
+      "Name": "VRAM",
+      "UUID": "com.diy.metrics.vram",
+      "Icon": "static/vram.png",
+      "Tooltip": "Video memory in use",
+      "States": [
+        {
+          "Image": "static/vram.png",
+          "ShowTitle": false
+        }
+      ],
+      "Controllers": [
+        "Keypad"
+      ],
+      "SupportedInMultiActions": false,
+      "UserTitleEnabled": false,
+      "DisableAutomaticStates": true,
+      "PropertyInspectorPath": "propertyInspector/index.html"
+    },
+    {
+      "Name": "Disk",
+      "UUID": "com.diy.metrics.disk",
+      "Icon": "static/disk.png",
+      "Tooltip": "How hard a drive is working, or how full it is",
+      "States": [
+        {
+          "Image": "static/disk.png",
+          "ShowTitle": false
+        }
+      ],
+      "Controllers": [
+        "Keypad"
+      ],
+      "SupportedInMultiActions": false,
+      "UserTitleEnabled": false,
+      "DisableAutomaticStates": true,
+      "PropertyInspectorPath": "propertyInspector/index.html"
+    }
+  ],
+  "SDKVersion": 3,
+  "Author": "DIY",
+  "Name": "Metrics",
+  "Icon": "static/plugin.png",
+  "CategoryIcon": "static/plugin.png",
+  "Category": "Metrics",
+  "CodePathWin": "plugin/index.js",
+  "CodePathMac": "plugin/index.js",
+  "Description": "CPU, RAM, GPU, VRAM and disk, live on your keys",
+  "Version": "1.0.0",
+  "URL": "https://github.com",
+  "OS": [
+    {
+      "Platform": "windows",
+      "MinimumVersion": "10"
+    },
+    {
+      "Platform": "mac",
+      "MinimumVersion": "11"
+    }
+  ],
+  "Software": {
+    "MinimumVersion": "3.10.188.226"
+  },
+  "Nodejs": {
+    "Version": "20"
+  }
+}

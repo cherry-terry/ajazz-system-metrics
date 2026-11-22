@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<style>
+  :root { --text:#d6d6d6; --sub:#8e8e8e; --field:#3a3a3a; --line:#4a4a4a; --accent:#4ea1ff; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:10px 12px 16px; font:12px/1.45 "Segoe UI", -apple-system, Arial, sans-serif; color:var(--text); background:transparent; }
+  .row { display:grid; grid-template-columns: 112px 1fr; align-items:center; gap:8px; margin:7px 0; }
+  .row > label { color:var(--sub); }
+  select, input[type=number] { width:100%; height:24px; padding:0 6px; color:var(--text); background:var(--field); border:1px solid var(--line); border-radius:4px; font:inherit; }
+  input[type=number] { width:64px; }
+  .inline { display:flex; align-items:center; gap:6px; }
+  .colors { display:flex; gap:10px; }
+  .colors label { display:flex; flex-direction:column; align-items:center; gap:2px; color:var(--sub); font-size:11px; }
+  input[type=color] { width:36px; height:24px; padding:0; border:1px solid var(--line); border-radius:4px; background:none; cursor:pointer; }
+  h3 { margin:16px 0 4px; font-size:12px; font-weight:600; color:var(--text); }
+  .hint { color:var(--sub); font-size:11px; margin:2px 0 0; }
+  button { height:24px; padding:0 10px; color:var(--text); background:var(--field); border:1px solid var(--line); border-radius:4px; font:inherit; cursor:pointer; }
+  button:focus-visible, select:focus-visible, input:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
+  [hidden] { display:none !important; }
+</style>
+</head>
+<body>
+  <div class="row">
+    <label for="style">Style</label>
+    <select id="style">
+      <option value="bar">Color bar</option>
+      <option value="mono">Monochrome</option>
+      <option value="number">Number only</option>
+      <option value="graph">15-second graph</option>
+    </select>
+  </div>
+
+  <div class="row" data-for="ram vram">
+    <label for="unit">Unit</label>
+    <select id="unit">
+      <option value="gb">Gigabytes</option>
+      <option value="pct">Percent of total</option>
+    </select>
+  </div>
+
+  <div class="row" data-for="disk">
+    <label for="drive">Drive</label>
+    <select id="drive"><option value="">All drives</option></select>
+  </div>
+  <div class="row" data-for="disk">
+    <label for="diskView">Show</label>
+    <select id="diskView">
+      <option value="busy" data-os="windows">How busy the drive is</option>
+      <option value="full">How full the drive is</option>
+      <option value="free">Free space</option>
+    </select>
+  </div>
+
+  <div class="row" data-for="vram">
+    <label for="vramTotalGB">VRAM size</label>
+    <div class="inline"><input id="vramTotalGB" type="number" min="0" max="256" step="1"> GB</div>
+  </div>
+  <p class="hint" data-for="vram" style="margin-left:120px">0 = detect automatically.</p>
+
+  <div class="row">
+    <label for="hold">Hold opens</label>
+    <select id="hold"></select>
+  </div>
+  <p class="hint" id="tapHint" style="margin-left:120px"></p>
+
+  <h3>Colors and thresholds</h3>
+  <div class="row">
+    <label for="warn">Calm below</label>
+    <div class="inline"><input id="warn" type="number" min="0" max="100"> %</div>
+  </div>
+  <div class="row">
+    <label for="crit">Red from</label>
+    <div class="inline"><input id="crit" type="number" min="1" max="100"> %</div>
+  </div>
+  <div class="row">
+    <label for="peg">Glow from</label>
+    <div class="inline"><input id="peg" type="number" min="1" max="101"> %</div>
+  </div>
+  <div class="row">
+    <label>Colors</label>
+    <div class="colors">
+      <label>calm<input id="calm" type="color"></label>
+      <label>warm<input id="warm" type="color"></label>
+      <label>load<input id="hot" type="color"></label>
+    </div>
+  </div>
+  <div class="row">
+    <span></span>
+    <div><button id="reset" type="button">Restore default colors</button></div>
+  </div>
+
+<script>
+const DEFAULTS = { style:'bar', warn:30, crit:85, peg:97, calm:'#3ddc5a', warm:'#ffd21f', hot:'#ff3b30',
+                   unit:'gb', diskView:'busy', drive:'', vramTotalGB:0, hold:'' };
+const DEFAULT_HOLD = { cpu:'taskmgr', ram:'taskmgr', gpu:'taskmgr', vram:'taskmgr', disk:'drive' };
+const HOLD = {
+  windows: [['taskmgr','Task Manager'], ['resmon','Resource Monitor'], ['drive','Drive in File Explorer'], ['storage','Storage settings'], ['none','Nothing']],
+  mac:     [['activity','Activity Monitor'], ['finder','Finder'], ['settings','System Settings: Storage'], ['sysinfo','System Information'], ['none','Nothing']],
+};
+const FIELDS = ['style','unit','drive','diskView','vramTotalGB','hold','warn','crit','peg','calm','warm','hot'];
+let ws, uuid, action, kind, platform = /Mac/i.test(navigator.userAgent) ? 'mac' : 'windows';
+let settings = Object.assign({}, DEFAULTS);
+const $ = id => document.getElementById(id);
+
+function connectElgatoStreamDeckSocket(port, inUUID, registerEvent, info, actionInfo) {
+  uuid = inUUID;
+  try { const i = JSON.parse(info); const p = i && i.application && i.application.platform; if (p) platform = /mac/i.test(p) ? 'mac' : 'windows'; } catch (_) {}
+  try {
+    const a = JSON.parse(actionInfo);
+    action = a.action;
+    settings = Object.assign({}, DEFAULTS, (a.payload && a.payload.settings) || {});
+  } catch (_) {}
+  kind = (action || '').split('.').pop();
+  setup();
+  ws = new WebSocket('ws://127.0.0.1:' + port);
+  ws.onopen = () => {
+    ws.send(JSON.stringify({ event: registerEvent, uuid }));
+    ws.send(JSON.stringify({ event: 'getSettings', context: uuid }));
+    ws.send(JSON.stringify({ event: 'sendToPlugin', action, context: uuid, payload: { type: 'hello' } }));
+  };
+  ws.onmessage = e => {
+    const m = JSON.parse(e.data);
+    if (m.event === 'didReceiveSettings' && m.payload) {
+      settings = Object.assign({}, DEFAULTS, m.payload.settings || {});
+      fill();
+    } else if (m.event === 'sendToPropertyInspector' && m.payload && m.payload.type === 'info') {
+      platform = m.payload.platform === 'mac' ? 'mac' : 'windows';
+      setDrives(m.payload.drives || []);
+      setup();
+    }
+  };
+}
+const connectSocket = connectElgatoStreamDeckSocket;
+
+function setup() {
+  document.querySelectorAll('[data-for]').forEach(el => { el.hidden = !el.dataset.for.split(' ').includes(kind); });
+  document.querySelectorAll('[data-os]').forEach(el => { el.hidden = el.dataset.os !== platform; el.disabled = el.hidden; });
+  const hold = $('hold'); hold.innerHTML = '';
+  for (const [v, t] of HOLD[platform]) hold.add(new Option(t, v));
+  $('drive').closest('.row').hidden = kind !== 'disk' || platform === 'mac';
+  const tap = { ram: 'A tap switches between GB and %.', vram: 'A tap switches between GB and %.',
+    disk: platform === 'mac' ? 'A tap switches between used and free space.' : 'A tap cycles through activity, used space and free space.' }[kind];
+  $('tapHint').textContent = 'Hold for half a second to open it.' + (tap ? ' ' + tap : '');
+  fill();
+}
+
+function setDrives(list) {
+  const sel = $('drive'); sel.innerHTML = '';
+  sel.add(new Option('All drives', ''));
+  for (const d of list) if (d !== '/') sel.add(new Option(d, d));
+  fill();
+}
+
+function holdValue() {
+  let h = settings.hold || DEFAULT_HOLD[kind] || 'taskmgr';
+  if (platform === 'mac') h = { taskmgr:'activity', resmon:'activity', drive:'finder', storage:'settings' }[h] || h;
+  return h;
+}
+
+function fill() {
+  for (const f of FIELDS) {
+    const el = $(f); if (!el) continue;
+    el.value = f === 'hold' ? holdValue() : settings[f];
+  }
+}
+
+function save() {
+  for (const f of FIELDS) {
+    const el = $(f); if (!el) continue;
+    settings[f] = el.type === 'number' ? Number(el.value) : el.value;
+  }
+  if (!ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify({ event: 'setSettings', context: uuid, payload: settings }));
+  ws.send(JSON.stringify({ event: 'sendToPlugin', action, context: uuid, payload: { type: 'settings', settings } }));
+}
+
+FIELDS.forEach(f => { const el = $(f); el && el.addEventListener(el.tagName === 'SELECT' ? 'change' : 'input', save); });
+$('reset').addEventListener('click', () => {
+  for (const k of ['calm','warm','hot','warn','crit','peg']) settings[k] = DEFAULTS[k];
+  fill(); save();
+});
+</script>
+</body>
+</html>
