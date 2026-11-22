@@ -1,5 +1,7 @@
 <div align="center">
 
+![Social banner](screenshots/social-banner-metrick.jpg)
+
 # 📈 Metrics
 
 **CPU, RAM, GPU, VRAM and disk, live on your Stream Dock keys**
