@@ -1,7 +1,8 @@
 // Metrics — one shared reading for every key.
 // Windows: one hidden PowerShell process reads performance counters through WMI/CIM
 //          (class names are not localized, so it works on any Windows language), no admin rights.
-// macOS:   os.cpus, vm_stat, ioreg. Disk: space only (macOS does not expose activity without root).
+//          FPS comes from RivaTuner Statistics Server shared memory, only when RTSS is running.
+// macOS:   os.cpus, vm_stat, ioreg, netstat, pmset. Disk: space only (macOS does not expose activity without root).
 'use strict';
 
 const os = require('os');
@@ -33,6 +34,57 @@ function Get-VramTotal {
   $max
 }
 $vramTotal = Get-VramTotal
+
+# Network adapters that only mirror traffic of a real one, or carry none.
+$skipNet = 'isatap|Teredo|Loopback|Pseudo|6to4|vEthernet|Hyper-V|VirtualBox|VMware|WAN Miniport|Kernel Debug'
+
+# FPS of the foreground game from RivaTuner Statistics Server (RTSSSharedMemoryV2).
+# Layout per RTSSSharedMemory.h: header dwSignature 'RTSS', dwVersion, dwAppEntrySize, dwAppArrOffset, dwAppArrSize;
+# app entry: dwProcessID @0, szName[260] @4, dwFlags @264, dwTime0 @268, dwTime1 @272, dwFrames @276, dwFrameTime @280.
+$fgType = 0
+function Get-ForegroundPid {
+  if ($script:fgType -eq 0) {
+    try {
+      Add-Type -Namespace MetricsFg -Name W -MemberDefinition '[DllImport("user32.dll")] public static extern System.IntPtr GetForegroundWindow(); [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(System.IntPtr h, out uint p);'
+      $script:fgType = 1
+    } catch { $script:fgType = -1 }
+  }
+  if ($script:fgType -ne 1) { return 0 }
+  $fp = [uint32]0
+  [void][MetricsFg.W]::GetWindowThreadProcessId([MetricsFg.W]::GetForegroundWindow(), [ref]$fp)
+  $fp
+}
+function Get-Fps {
+  $mm = $null; $va = $null
+  try { $mm = [System.IO.MemoryMappedFiles.MemoryMappedFile]::OpenExisting('RTSSSharedMemoryV2', [System.IO.MemoryMappedFiles.MemoryMappedFileRights]::Read) } catch { return @{ on = 0 } }
+  try {
+    $va = $mm.CreateViewAccessor(0, 0, [System.IO.MemoryMappedFiles.MemoryMappedFileAccess]::Read)
+    if ($va.ReadUInt32(0) -ne 0x52545353 -or $va.ReadUInt32(4) -lt 0x00020000) { return @{ on = 0 } }
+    $es = [double]$va.ReadUInt32(8); $ao = [double]$va.ReadUInt32(12); $an = [Math]::Min(256, [double]$va.ReadUInt32(16))
+    $fpid = Get-ForegroundPid
+    $now = [double][BitConverter]::ToUInt32([BitConverter]::GetBytes([Environment]::TickCount), 0)
+    $best = $null; $bestAge = 1e12
+    for ($i = 0; $i -lt $an; $i++) {
+      $b = [long]($ao + $i * $es)
+      $apid = $va.ReadUInt32($b); if (-not $apid) { continue }
+      $t0 = [double]$va.ReadUInt32($b + 268); $t1 = [double]$va.ReadUInt32($b + 272)
+      $fr = [double]$va.ReadUInt32($b + 276); $ft = [double]$va.ReadUInt32($b + 280)
+      if ($t1 -le $t0 -or $fr -le 0) { continue }
+      $age = $now - $t1; if ($age -lt 0) { $age += 4294967296 }
+      if ($age -gt 3000) { continue }
+      $e = @{ fps = 1000.0 * $fr / ($t1 - $t0); ms = $ft / 1000.0 }
+      if ($fpid -and $apid -eq $fpid) { $best = $e; break }
+      if ($age -lt $bestAge) { $best = $e; $bestAge = $age }
+    }
+    $r = @{ on = 1 }
+    if ($best) { $r.fps = [Math]::Round($best.fps, 1); $r.ms = [Math]::Round($best.ms, 2) }
+    return $r
+  } catch { return @{ on = 0 } } finally { if ($va) { $va.Dispose() }; if ($mm) { $mm.Dispose() } }
+}
+
+$bat = $null; $batChecked = $false
+$netPrev = $null
+$diskPrev = $null
 $n = 0
 while ($true) {
   $t0 = [Environment]::TickCount
@@ -62,16 +114,72 @@ while ($true) {
   }
   if ($vramTotal) { $o.vramTotal = $vramTotal }
 
-  $dk = Get-CimInstance -ClassName Win32_PerfFormattedData_PerfDisk_PhysicalDisk
-  if ($dk) {
-    $list = @()
-    foreach ($x in $dk) {
-      if ($x.Name -ne '_Total') {
-        $list += @{ n = [string]$x.Name; a = [Math]::Max(0, [Math]::Min(100, 100 - [double]$x.PercentIdleTime)) }
+  # Disk activity: raw idle-time counter, turned into "% busy" here from two readings a second apart.
+  # The ready-made formatted counter often reads 0 when queried this way, so it is only a fallback.
+  $dr = Get-CimInstance -ClassName Win32_PerfRawData_PerfDisk_PhysicalDisk
+  $list = @(); $dOk = $false
+  if ($dr) {
+    $cur = @{}
+    foreach ($x in $dr) {
+      if ($x.Name -eq '_Total') { continue }
+      $nm = [string]$x.Name; $idle = [double]$x.PercentIdleTime; $ts = [double]$x.Timestamp_Sys100NS
+      $cur[$nm] = @($idle, $ts)
+      if ($diskPrev -and $diskPrev.ContainsKey($nm)) {
+        $p0 = $diskPrev[$nm]; $dt = $ts - $p0[1]
+        if ($dt -gt 0) {
+          $busy = 100 - 100 * ($idle - $p0[0]) / $dt
+          $list += @{ n = $nm; a = [Math]::Max(0, [Math]::Min(100, $busy)) }; $dOk = $true
+        }
       }
     }
-    $o.disks = $list
+    $diskPrev = $cur
   }
+  if (-not $dOk -and -not $diskPrev) {
+    $dk = Get-CimInstance -ClassName Win32_PerfFormattedData_PerfDisk_PhysicalDisk
+    foreach ($x in $dk) {
+      if ($x.Name -ne '_Total') { $list += @{ n = [string]$x.Name; a = [Math]::Max(0, [Math]::Min(100, 100 - [double]$x.PercentIdleTime)) }; $dOk = $true }
+    }
+  }
+  if ($dOk) { $o.disks = $list }
+
+  # Network: byte counters of every adapter that is up, turned into bytes per second here.
+  # Works the same on every Windows build; the WMI rate counter is only a fallback.
+  $rx = 0; $tx = 0; $nOk = $false
+  try {
+    foreach ($a in [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
+      if ([string]$a.OperationalStatus -ne 'Up') { continue }
+      $nt = [string]$a.NetworkInterfaceType
+      if ($nt -eq 'Loopback' -or $nt -eq 'Tunnel') { continue }
+      if ($a.Name -match $skipNet -or $a.Description -match $skipNet) { continue }
+      $st = $null
+      try { $st = $a.GetIPStatistics() } catch { try { $st = $a.GetIPv4Statistics() } catch {} }
+      if ($st) { $rx += [double]$st.BytesReceived; $tx += [double]$st.BytesSent; $nOk = $true }
+    }
+  } catch {}
+  if ($nOk) {
+    $tn = [Environment]::TickCount
+    if ($netPrev) {
+      $dt = ($tn - $netPrev.t) / 1000.0
+      if ($dt -gt 0.2) { $o.net = @{ rx = [Math]::Max(0, ($rx - $netPrev.rx) / $dt); tx = [Math]::Max(0, ($tx - $netPrev.tx) / $dt) } }
+    }
+    $netPrev = @{ rx = $rx; tx = $tx; t = $tn }
+  } else {
+    $ni = Get-CimInstance -ClassName Win32_PerfFormattedData_Tcpip_NetworkInterface
+    if ($ni) {
+      $rx = 0; $tx = 0
+      foreach ($x in $ni) { if ($x.Name -notmatch $skipNet) { $rx += [double]$x.BytesReceivedPersec; $tx += [double]$x.BytesSentPersec } }
+      $o.net = @{ rx = $rx; tx = $tx }
+    }
+  }
+
+  if (($n % 5) -eq 1) {
+    $b = @(Get-CimInstance -ClassName Win32_Battery)
+    $batChecked = $true
+    if ($b.Count -gt 0 -and $b[0]) { $bat = @{ c = [double]$b[0].EstimatedChargeRemaining; s = [int]$b[0].BatteryStatus; m = [double]$b[0].EstimatedRunTime } } else { $bat = $null }
+  }
+  if ($bat) { $o.bat = $bat } elseif ($batChecked) { $o.bat = 0 }
+
+  $o.fps = Get-Fps
   [Console]::Out.WriteLine(($o | ConvertTo-Json -Compress -Depth 4))
   [Console]::Out.Flush()
   $left = 1000 - ([Environment]::TickCount - $t0)
@@ -85,6 +193,9 @@ class Sampler {
         this.listeners = new Set();
         this.history = [];          // last 15 samples for the graph
         this.wantDrives = new Set(); // drives that need space readings
+        this.want = { net: false, battery: false }; // extra readings outside Windows
+        this.netPrev = null;
+        this.other = {};
         this.ps = null;
         this.psData = null;
         this.psAt = 0;
@@ -162,9 +273,75 @@ class Sampler {
         });
     }
 
+    // ----- macOS and others: network and battery -----
+    _netTick() {
+        const done = (rx, tx) => {
+            const now = Date.now();
+            const p = this.netPrev;
+            this.netPrev = { rx, tx, t: now };
+            if (!p || now <= p.t) return;
+            const dt = (now - p.t) / 1000;
+            this.other.net = { rx: Math.max(0, (rx - p.rx) / dt), tx: Math.max(0, (tx - p.tx) / dt) };
+        };
+        if (IS_MAC) {
+            execFile('/usr/sbin/netstat', ['-ibn'], { timeout: 2000, maxBuffer: 1 << 20 }, (err, out) => {
+                if (err || !out) return;
+                let rx = 0, tx = 0;
+                for (const line of out.split('\n').slice(1)) {
+                    const f = line.trim().split(/\s+/);
+                    // Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll; one <Link#n> row per interface
+                    if (f.length < 10 || !/^<Link#/.test(f[2]) || /^(lo|gif|stf|utun|awdl|llw|bridge|anpi|ap)\d/.test(f[0])) continue;
+                    const off = f.length >= 11 ? 0 : -1; // Address can be empty
+                    rx += Number(f[6 + off]) || 0; tx += Number(f[9 + off]) || 0;
+                }
+                done(rx, tx);
+            });
+        } else {
+            fs.readFile('/proc/net/dev', 'utf8', (err, out) => {
+                if (err || !out) return;
+                let rx = 0, tx = 0;
+                for (const line of out.split('\n').slice(2)) {
+                    const m = /^\s*([^:]+):\s*(.*)$/.exec(line);
+                    if (!m || /^(lo|docker|veth|br-|virbr)/.test(m[1])) continue;
+                    const f = m[2].trim().split(/\s+/).map(Number);
+                    rx += f[0] || 0; tx += f[8] || 0;
+                }
+                done(rx, tx);
+            });
+        }
+    }
+
+    _batteryTick() {
+        if (IS_MAC) {
+            execFile('/usr/bin/pmset', ['-g', 'batt'], { timeout: 2000 }, (err, out) => {
+                if (err || !out) return;
+                const m = /(\d+)%;\s*([^;\n]+)(?:;\s*([^\n]*))?/.exec(out);
+                if (!m) { this.other.bat = { none: true }; return; }
+                const state = m[2].trim().toLowerCase();
+                const t = /(\d+):(\d+) remaining/.exec(m[3] || '');
+                const plugged = /AC Power/.test(out) || state === 'charging' || state === 'charged';
+                this.other.bat = { pct: Number(m[1]), plugged, charging: state === 'charging' || state === 'finishing charge',
+                    mins: t && !plugged ? Number(t[1]) * 60 + Number(t[2]) : null };
+            });
+        } else {
+            try {
+                const dir = '/sys/class/power_supply';
+                const b = fs.readdirSync(dir).find(n => /^BAT/.test(n));
+                if (!b) { this.other.bat = { none: true }; return; }
+                const pct = Number(fs.readFileSync(`${dir}/${b}/capacity`, 'utf8'));
+                const st = fs.readFileSync(`${dir}/${b}/status`, 'utf8').trim().toLowerCase();
+                this.other.bat = { pct, plugged: st !== 'discharging', charging: st === 'charging', mins: null };
+            } catch (_) { this.other.bat = { none: true }; }
+        }
+    }
+
     // ----- shared tick -----
     _tick() {
         if (IS_MAC) this._macTick();
+        if (!IS_WIN) {
+            if (this.want.net) this._netTick(); else { this.netPrev = null; this.other.net = null; }
+            if (this.want.battery && (!this.batAt || Date.now() - this.batAt > 5000)) { this.batAt = Date.now(); this._batteryTick(); }
+        }
         const now = Date.now();
         const ps = (this.psData && now - this.psAt < 4000) ? this.psData : null;
 
@@ -201,7 +378,23 @@ class Sampler {
         const space = {};
         for (const d of this.wantDrives) space[d] = diskSpace(d);
 
-        const sample = { t: now, cpu, ramUsed, ramTotal, gpu, vramUsed, vramTotal, disks, space, live: IS_WIN ? !!ps : true };
+        // Network: bytes per second received / sent
+        let net = null;
+        if (ps && ps.net && typeof ps.net.rx === 'number') net = { rx: ps.net.rx, tx: ps.net.tx };
+        if (!IS_WIN && this.other.net) net = this.other.net;
+
+        // Battery: null = not known yet, { none } = this computer has no battery
+        let bat = null;
+        if (ps && ps.bat === 0) bat = { none: true };
+        else if (ps && ps.bat && typeof ps.bat.c === 'number') bat = winBattery(ps.bat);
+        if (!IS_WIN && this.other.bat) bat = this.other.bat;
+
+        // FPS: Windows only, from RivaTuner Statistics Server
+        let fps = null;
+        if (!IS_WIN) fps = { on: false, unsupported: true };
+        else if (ps && ps.fps) fps = { on: !!ps.fps.on, fps: typeof ps.fps.fps === 'number' ? ps.fps.fps : null, ms: typeof ps.fps.ms === 'number' ? ps.fps.ms : null };
+
+        const sample = { t: now, cpu, ramUsed, ramTotal, gpu, vramUsed, vramTotal, disks, space, net, bat, fps, live: IS_WIN ? !!ps : true };
         this.history.push(sample);
         if (this.history.length > 15) this.history.shift();
         for (const fn of this.listeners) { try { fn(sample, this.history); } catch (e) { this.log('listener', String(e && e.stack || e)); } }
@@ -210,6 +403,16 @@ class Sampler {
 
 // ---------- helpers ----------
 function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+// Win32_Battery: BatteryStatus 1 = discharging, 2 = on AC, 3 = full, 4/5 = low/critical,
+// 6-9 = charging, 11 = partly charged. EstimatedRunTime is minutes, 71582788 = unknown.
+function winBattery(b) {
+    const plugged = [2, 3, 6, 7, 8, 9, 11].includes(b.s);
+    const pct = clamp(b.c, 0, 100);
+    const charging = (b.s >= 6 && b.s <= 9) || (b.s === 2 && pct < 99);
+    const mins = !plugged && b.m > 0 && b.m < 100000 ? b.m : null;
+    return { pct, plugged, charging, mins };
+}
 
 function cpuTimes() {
     let idle = 0, total = 0;

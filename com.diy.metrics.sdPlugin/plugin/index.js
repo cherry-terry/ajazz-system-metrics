@@ -1,4 +1,4 @@
-// Metrics — Stream Dock plugin: CPU, RAM, GPU, VRAM and disk, live on your keys.
+// Metrics — Stream Dock plugin: CPU, RAM, GPU, VRAM, disk, network, battery and FPS, live on your keys.
 'use strict';
 
 const fs = require('fs');
@@ -32,7 +32,11 @@ const KINDS = {
     'com.diy.metrics.gpu': 'gpu',
     'com.diy.metrics.vram': 'vram',
     'com.diy.metrics.disk': 'disk',
+    'com.diy.metrics.net': 'net',
+    'com.diy.metrics.battery': 'battery',
+    'com.diy.metrics.fps': 'fps',
 };
+const HELP_URL = 'https://github.com/cherry-terry/ajazz-system-metrics#-fps';
 const DEFAULTS = {
     style: 'bar',            // bar | mono | number | graph
     warn: 30, crit: 85, peg: 97,
@@ -42,17 +46,41 @@ const DEFAULTS = {
     drive: '',               // '' = all drives (activity) / system drive (space)
     vramTotalGB: 0,          // 0 = automatic
     hold: '',                // '' = default for this key
+    netView: 'down',         // NET: down | up | both
+    netUnit: 'bytes',        // NET: bytes (MB/s) | bits (Mb/s)
+    netMax: 500,             // NET: full bar at this speed, Mbit/s
+    batView: 'pct',          // BATTERY: pct | time
+    fpsView: 'fps',          // FPS: fps | ms
+    fpsMax: 144,             // FPS: full bar at this frame rate
 };
-const DEFAULT_HOLD = { cpu: 'taskmgr', ram: 'taskmgr', gpu: 'taskmgr', vram: 'taskmgr', disk: 'drive' };
+// Battery and FPS are bad when LOW, so their thresholds count downwards.
+const KIND_DEFAULTS = {
+    battery: { warn: 50, crit: 20, peg: 5 },  // calm above 50 %, red below 20 %, glow below 5 %
+    fps: { warn: 60, crit: 30, peg: 0 },      // calm from 60 fps, red below 30, no glow
+    net: { warn: 50, crit: 90, peg: 101 },    // busy traffic is not an alarm: no glow by default
+};
+const INVERTED = new Set(['battery', 'fps']);
+const DEFAULT_HOLD = { cpu: 'taskmgr', ram: 'taskmgr', gpu: 'taskmgr', vram: 'taskmgr', disk: 'drive', net: 'resmon', battery: 'power', fps: 'help' };
 const HOLD_MS = 500;
 
 const contexts = new Map(); // context -> { action, kind, settings, lastSvg, pressTimer, held }
 
-function normalize(s) {
-    const o = Object.assign({}, DEFAULTS, s || {});
-    for (const k of ['warn', 'crit', 'peg', 'vramTotalGB']) o[k] = Number(o[k]) || 0;
-    if (o.crit <= o.warn) o.crit = o.warn + 1;
+function normalize(s, kind) {
+    const o = Object.assign({}, DEFAULTS, KIND_DEFAULTS[kind] || {}, s || {});
+    for (const k of ['warn', 'crit', 'peg', 'vramTotalGB', 'netMax', 'fpsMax']) o[k] = Number(o[k]) || 0;
+    if (o.netMax <= 0) o.netMax = DEFAULTS.netMax;
+    if (o.fpsMax <= 0) o.fpsMax = DEFAULTS.fpsMax;
+    if (INVERTED.has(kind)) { if (o.crit >= o.warn) o.crit = Math.max(0, o.warn - 1); }
+    else if (o.crit <= o.warn) o.crit = o.warn + 1;
     return o;
+}
+
+// For keys where low is bad, render gets "100 - value" and mirrored thresholds,
+// so the same calm → warm → load scale works in both directions.
+function renderSettings(c) {
+    const s = c.settings;
+    if (!INVERTED.has(c.kind)) return s;
+    return Object.assign({}, s, { warn: 100 - s.warn, crit: 100 - s.crit, peg: s.peg > 0 ? 100 - s.peg : Infinity });
 }
 
 // ---------- Stream Dock WebSocket ----------
@@ -69,7 +97,7 @@ ws.on('message', raw => {
     switch (event) {
         case 'willAppear':
             if (!kind) return;
-            contexts.set(context, { action, kind, settings: normalize(payload && payload.settings), lastSvg: null });
+            contexts.set(context, { action, kind, settings: normalize(payload && payload.settings, kind), lastSvg: null });
             refreshWants();
             sampler.start();
             draw(context, sampler.history[sampler.history.length - 1], sampler.history, true);
@@ -85,6 +113,7 @@ ws.on('message', raw => {
         case 'sendToPlugin':
             if (payload && payload.type === 'settings') updateSettings(context, payload.settings);
             if (payload && payload.type === 'hello') sendPiInfo(context, action);
+            if (payload && payload.type === 'help') openUrl(HELP_URL);
             break;
         case 'propertyInspectorDidAppear':
             sendPiInfo(context, action);
@@ -97,7 +126,7 @@ ws.on('message', raw => {
 function updateSettings(context, settings) {
     const c = contexts.get(context);
     if (!c || !settings) return;
-    c.settings = normalize(settings);
+    c.settings = normalize(settings, c.kind);
     refreshWants();
     redraw(context);
 }
@@ -130,15 +159,34 @@ function onKeyUp(context) {
     const s = c.settings;
     if (c.kind === 'ram' || c.kind === 'vram') s.unit = s.unit === 'pct' ? 'gb' : 'pct';
     else if (c.kind === 'disk') s.diskView = { busy: 'full', full: 'free', free: IS_MAC ? 'full' : 'busy' }[s.diskView] || 'busy';
+    else if (c.kind === 'net') s.netView = { down: 'up', up: 'both', both: 'down' }[s.netView] || 'down';
+    else if (c.kind === 'battery') s.batView = s.batView === 'time' ? 'pct' : 'time';
+    else if (c.kind === 'fps') { if (!rtssOn()) return; s.fpsView = s.fpsView === 'ms' ? 'fps' : 'ms'; }
     else return;
     send({ event: 'setSettings', context, payload: s });
     refreshWants();
     redraw(context);
 }
 
+function rtssOn() {
+    const h = sampler.history, f = h.length ? h[h.length - 1].fps : null;
+    return !!(f && f.on);
+}
+
+function openUrl(url) {
+    try {
+        if (IS_MAC) spawn('/usr/bin/open', [url], { detached: true, stdio: 'ignore' }).unref();
+        else if (IS_WIN) spawn('cmd.exe', ['/d', '/c', `start "" "${url}"`], { detached: true, stdio: 'ignore', windowsHide: true, windowsVerbatimArguments: true }).unref();
+        log('open', url);
+    } catch (e) { log('open failed', String(e)); }
+}
+
 function openTarget(c) {
     let t = c.settings.hold || DEFAULT_HOLD[c.kind];
+    // FPS without RivaTuner: a hold always explains how to set it up
+    if (c.kind === 'fps' && !rtssOn()) t = 'help';
     if (t === 'none') return;
+    if (t === 'help') return openUrl(HELP_URL);
     const drive = c.settings.drive;
     try {
         if (IS_MAC) {
@@ -148,6 +196,8 @@ function openTarget(c) {
                 finder: [drive && drive.startsWith('/') ? drive : '/'],
                 settings: ['x-apple.systempreferences:com.apple.settings.Storage'],
                 sysinfo: ['-a', 'System Information'],
+                network: ['x-apple.systempreferences:com.apple.Network-Settings.extension'],
+                power: ['x-apple.systempreferences:com.apple.Battery-Settings.extension'],
             }[t] || ['-a', 'Activity Monitor'];
             spawn('/usr/bin/open', cmd, { detached: true, stdio: 'ignore' }).unref();
         } else if (IS_WIN) {
@@ -157,6 +207,8 @@ function openTarget(c) {
                 resmon: 'resmon',
                 drive: rootOf(drive),
                 storage: 'ms-settings:storagesense',
+                network: 'ms-settings:network-status',
+                power: 'ms-settings:batterysaver',
             }[t] || 'taskmgr';
             spawn('cmd.exe', ['/d', '/c', `start "" "${target}"`], { detached: true, stdio: 'ignore', windowsHide: true, windowsVerbatimArguments: true }).unref();
         }
@@ -170,8 +222,11 @@ sampler.onSample((sample, history) => { for (const ctx of contexts.keys()) draw(
 
 function refreshWants() {
     sampler.wantDrives.clear();
+    sampler.want.net = false; sampler.want.battery = false;
     for (const c of contexts.values()) {
         if (c.kind === 'disk') sampler.wantDrives.add(c.settings.drive || '');
+        if (c.kind === 'net') sampler.want.net = true;
+        if (c.kind === 'battery') sampler.want.battery = true;
     }
 }
 
@@ -183,10 +238,20 @@ function redraw(context) {
 const GB = 1024 ** 3;
 const fmtGB = (bytes) => { const g = bytes / GB; return g < 10 ? g.toFixed(1) : String(Math.round(g)); };
 
+// Network speed with at most 4 characters: 0.4 KB/s, 85.2 KB/s, 112 MB/s, 1.1 GB/s (or Kb/s, Mb/s, Gb/s).
+function fmtRate(bytesPerSec, bits) {
+    let v = bytesPerSec * (bits ? 8 : 1) / 1000;
+    const units = bits ? ['Kb/s', 'Mb/s', 'Gb/s'] : ['KB/s', 'MB/s', 'GB/s'];
+    let i = 0;
+    while (v >= 999.5 && i < units.length - 1) { v /= 1000; i++; }
+    return { value: v < 99.95 ? v.toFixed(1) : String(Math.round(v)), unit: units[i] };
+}
+const fmtTime = (mins) => `${Math.floor(mins / 60)}:${String(Math.round(mins % 60)).padStart(2, '0')}`;
+
 // Works out what the key shows: value, unit, and the percent used for color and bar.
 function reading(c, sample) {
     const s = c.settings;
-    const r = { kind: c.kind, label: c.kind.toUpperCase(), value: null, unit: '%', pct: null, letter: null };
+    const r = { kind: c.kind, label: c.kind.toUpperCase(), value: null, unit: { net: 'MB/s', fps: 'fps' }[c.kind] || '%', pct: null, letter: null };
     if (!sample) return r;
     switch (c.kind) {
         case 'cpu':
@@ -232,22 +297,78 @@ function reading(c, sample) {
             }
             break;
         }
+        case 'net': {
+            const n = sample.net;
+            r.variant = s.netView;
+            if (!n) break;
+            const bits = s.netUnit === 'bits';
+            const pctOf = (b) => Math.max(0, Math.min(100, 100 * b * 8 / (s.netMax * 1e6)));
+            if (s.netView === 'both') {
+                const d = fmtRate(n.rx, bits), u = fmtRate(n.tx, bits);
+                r.rows = [{ dir: 'down', value: d.value, unit: d.unit, pct: pctOf(n.rx) }, { dir: 'up', value: u.value, unit: u.unit, pct: pctOf(n.tx) }];
+                r.pct = pctOf(n.rx); r.pct2 = pctOf(n.tx);
+                r.colorPct = Math.max(r.pct, r.pct2);
+                r.value = d.value; r.unit = d.unit;
+            } else {
+                const b = s.netView === 'up' ? n.tx : n.rx;
+                const f = fmtRate(b, bits);
+                r.pct = pctOf(b); r.value = f.value;
+                r.unit = f.unit + (s.netView === 'up' ? ' up' : ' down');
+            }
+            break;
+        }
+        case 'battery': {
+            const b = sample.bat;
+            if (!b) break;
+            if (b.none) { r.msg = ['No battery', 'on this computer']; break; }
+            r.pct = b.pct;
+            r.colorPct = 100 - b.pct;
+            if (b.plugged) r.variant = 'charging';
+            if (s.batView === 'time' && b.mins != null) { r.value = fmtTime(b.mins); r.unit = 'left'; }
+            else { r.value = String(Math.round(b.pct)); r.unit = b.charging ? '% charging' : (b.plugged ? '% plugged in' : '%'); }
+            break;
+        }
+        case 'fps': {
+            const f = sample.fps;
+            if (!f) break;
+            if (f.unsupported) { r.msg = ['Windows only', 'needs RivaTuner']; break; }
+            if (!f.on) { r.msg = ['RTSS', 'not running']; r.hint = 'hold for help'; break; }
+            if (f.fps == null) { r.unit = 'no game'; break; }
+            r.pct = Math.max(0, Math.min(100, 100 * f.fps / s.fpsMax));
+            r.colorPct = 100 - f.fps;
+            if (s.fpsView === 'ms' && f.ms) { r.value = f.ms < 10 ? f.ms.toFixed(1) : String(Math.round(f.ms)); r.unit = 'ms'; }
+            else { r.value = String(Math.round(f.fps)); r.unit = 'fps'; }
+            break;
+        }
     }
     return r;
+}
+
+// The key image for one context: reading plus graph history.
+function compose(c, sample, history) {
+    const r = reading(c, sample);
+    if (c.settings.style === 'graph') {
+        const past = (history || []).map(h => reading(c, h));
+        r.history = past.map(p => p.pct);
+        if (r.rows) r.history2 = past.map(p => p.pct2);
+        if (c.kind === 'net') { // traffic graph scales to the recent peak, so small traffic is still visible
+            const peak = Math.max(2, ...r.history.filter(v => v != null), ...(r.history2 || []).filter(v => v != null));
+            const k = 90 / peak;
+            r.history = r.history.map(v => v == null ? v : v * k);
+            if (r.history2) r.history2 = r.history2.map(v => v == null ? v : v * k);
+        }
+    }
+    return render.key(r, renderSettings(c));
 }
 
 function draw(context, sample, history, force = false) {
     const c = contexts.get(context);
     if (!c) return;
     let svg;
-    try {
-        const r = reading(c, sample);
-        if (c.settings.style === 'graph') r.history = (history || []).map(h => reading(c, h).pct);
-        svg = render.key(r, c.settings);
-    } catch (e) { log('render error', String(e && e.stack || e)); return; }
+    try { svg = compose(c, sample, history); } catch (e) { log('render error', String(e && e.stack || e)); return; }
     if (!force && svg === c.lastSvg) return; // only send the image when it changed
     c.lastSvg = svg;
     send({ event: 'setImage', context, payload: { image: 'data:image/svg+xml;base64,' + Buffer.from(svg, 'utf8').toString('base64'), target: 0 } });
 }
 
-module.exports = { reading }; // for tests
+module.exports = { reading, normalize, compose }; // for tests

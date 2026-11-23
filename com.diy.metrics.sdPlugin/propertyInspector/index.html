@@ -16,6 +16,8 @@
   input[type=color] { width:36px; height:24px; padding:0; border:1px solid var(--line); border-radius:4px; background:none; cursor:pointer; }
   h3 { margin:16px 0 4px; font-size:12px; font-weight:600; color:var(--text); }
   .hint { color:var(--sub); font-size:11px; margin:2px 0 0; }
+  .note { color:var(--sub); font-size:11px; margin:10px 0 4px; padding:8px 10px; border:1px solid var(--line); border-radius:4px; }
+  .note button { margin-top:6px; }
   button { height:24px; padding:0 10px; color:var(--text); background:var(--field); border:1px solid var(--line); border-radius:4px; font:inherit; cursor:pointer; }
   button:focus-visible, select:focus-visible, input:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
   [hidden] { display:none !important; }
@@ -59,6 +61,52 @@
   </div>
   <p class="hint" data-for="vram" style="margin-left:120px">0 = detect automatically.</p>
 
+  <div class="row" data-for="net">
+    <label for="netView">Show</label>
+    <select id="netView">
+      <option value="down">Download</option>
+      <option value="up">Upload</option>
+      <option value="both">Both</option>
+    </select>
+  </div>
+  <div class="row" data-for="net">
+    <label for="netUnit">Unit</label>
+    <select id="netUnit">
+      <option value="bytes">Bytes (MB/s)</option>
+      <option value="bits">Bits (Mb/s)</option>
+    </select>
+  </div>
+  <div class="row" data-for="net">
+    <label for="netMax">Full bar at</label>
+    <div class="inline"><input id="netMax" type="number" min="1" max="100000" step="10"> Mbit/s</div>
+  </div>
+  <p class="hint" data-for="net" style="margin-left:120px">Your internet plan speed works well here.</p>
+
+  <div class="row" data-for="battery">
+    <label for="batView">Show</label>
+    <select id="batView">
+      <option value="pct">Charge in %</option>
+      <option value="time">Time left</option>
+    </select>
+  </div>
+
+  <div class="row" data-for="fps">
+    <label for="fpsView">Show</label>
+    <select id="fpsView">
+      <option value="fps">Frames per second</option>
+      <option value="ms">Frame time (ms)</option>
+    </select>
+  </div>
+  <div class="row" data-for="fps">
+    <label for="fpsMax">Full bar at</label>
+    <div class="inline"><input id="fpsMax" type="number" min="10" max="1000" step="1"> fps</div>
+  </div>
+  <div class="note" data-for="fps">
+    FPS comes from RivaTuner Statistics Server (installed with MSI Afterburner). It works on Windows only
+    and needs RTSS running while you play. You install it yourself.
+    <div><button id="help" type="button">How to set it up</button></div>
+  </div>
+
   <div class="row">
     <label for="hold">Hold opens</label>
     <select id="hold"></select>
@@ -67,17 +115,18 @@
 
   <h3>Colors and thresholds</h3>
   <div class="row">
-    <label for="warn">Calm below</label>
-    <div class="inline"><input id="warn" type="number" min="0" max="100"> %</div>
+    <label for="warn" id="warnLabel">Calm below</label>
+    <div class="inline"><input id="warn" type="number" min="0" max="100"> <span class="thrUnit">%</span></div>
   </div>
   <div class="row">
-    <label for="crit">Red from</label>
-    <div class="inline"><input id="crit" type="number" min="1" max="100"> %</div>
+    <label for="crit" id="critLabel">Red from</label>
+    <div class="inline"><input id="crit" type="number" min="0" max="100"> <span class="thrUnit">%</span></div>
   </div>
   <div class="row">
-    <label for="peg">Glow from</label>
-    <div class="inline"><input id="peg" type="number" min="1" max="101"> %</div>
+    <label for="peg" id="pegLabel">Glow from</label>
+    <div class="inline"><input id="peg" type="number" min="0" max="101"> <span class="thrUnit">%</span></div>
   </div>
+  <p class="hint" id="thrHint" style="margin-left:120px"></p>
   <div class="row">
     <label>Colors</label>
     <div class="colors">
@@ -92,14 +141,26 @@
   </div>
 
 <script>
-const DEFAULTS = { style:'bar', warn:30, crit:85, peg:97, calm:'#3ddc5a', warm:'#ffd21f', hot:'#ff3b30',
-                   unit:'gb', diskView:'busy', drive:'', vramTotalGB:0, hold:'' };
-const DEFAULT_HOLD = { cpu:'taskmgr', ram:'taskmgr', gpu:'taskmgr', vram:'taskmgr', disk:'drive' };
-const HOLD = {
-  windows: [['taskmgr','Task Manager'], ['resmon','Resource Monitor'], ['drive','Drive in File Explorer'], ['storage','Storage settings'], ['none','Nothing']],
-  mac:     [['activity','Activity Monitor'], ['finder','Finder'], ['settings','System Settings: Storage'], ['sysinfo','System Information'], ['none','Nothing']],
+const BASE = { style:'bar', warn:30, crit:85, peg:97, calm:'#3ddc5a', warm:'#ffd21f', hot:'#ff3b30',
+               unit:'gb', diskView:'busy', drive:'', vramTotalGB:0, hold:'',
+               netView:'down', netUnit:'bytes', netMax:500, batView:'pct', fpsView:'fps', fpsMax:144 };
+// Battery and FPS are bad when low, so their thresholds count downwards.
+const KIND_DEFAULTS = { battery:{ warn:50, crit:20, peg:5 }, fps:{ warn:60, crit:30, peg:0 }, net:{ warn:50, crit:90, peg:101 } };
+const THRESHOLDS = {
+  battery: { labels:['Calm above','Red below','Glow below'], unit:'%', max:100, hint:'Glow 0 = off.' },
+  fps:     { labels:['Calm from','Red below','Glow below'], unit:'fps', max:1000, hint:'Glow 0 = off.' },
+  net:     { labels:['Calm below','Red from','Glow from'], unit:'% of full bar', max:101, hint:'Glow 101 = off.' },
 };
-const FIELDS = ['style','unit','drive','diskView','vramTotalGB','hold','warn','crit','peg','calm','warm','hot'];
+let DEFAULTS = Object.assign({}, BASE);
+const DEFAULT_HOLD = { cpu:'taskmgr', ram:'taskmgr', gpu:'taskmgr', vram:'taskmgr', disk:'drive', net:'resmon', battery:'power', fps:'help' };
+// [value, text, kinds that offer it (empty = all)]
+const HOLD = {
+  windows: [['taskmgr','Task Manager'], ['resmon','Resource Monitor'], ['drive','Drive in File Explorer',['disk']], ['storage','Storage settings',['disk']],
+            ['network','Network settings',['net']], ['power','Power and battery settings',['battery']], ['help','FPS setup guide',['fps']], ['none','Nothing']],
+  mac:     [['activity','Activity Monitor'], ['finder','Finder',['disk']], ['settings','System Settings: Storage',['disk']], ['sysinfo','System Information'],
+            ['network','System Settings: Network',['net']], ['power','System Settings: Battery',['battery']], ['help','FPS setup guide',['fps']], ['none','Nothing']],
+};
+const FIELDS = ['style','unit','drive','diskView','vramTotalGB','netView','netUnit','netMax','batView','fpsView','fpsMax','hold','warn','crit','peg','calm','warm','hot'];
 let ws, uuid, action, kind, platform = /Mac/i.test(navigator.userAgent) ? 'mac' : 'windows';
 let settings = Object.assign({}, DEFAULTS);
 const $ = id => document.getElementById(id);
@@ -110,9 +171,12 @@ function connectElgatoStreamDeckSocket(port, inUUID, registerEvent, info, action
   try {
     const a = JSON.parse(actionInfo);
     action = a.action;
+    kind = (action || '').split('.').pop();
+    DEFAULTS = Object.assign({}, BASE, KIND_DEFAULTS[kind] || {});
     settings = Object.assign({}, DEFAULTS, (a.payload && a.payload.settings) || {});
   } catch (_) {}
   kind = (action || '').split('.').pop();
+  DEFAULTS = Object.assign({}, BASE, KIND_DEFAULTS[kind] || {});
   setup();
   ws = new WebSocket('ws://127.0.0.1:' + port);
   ws.onopen = () => {
@@ -138,11 +202,19 @@ function setup() {
   document.querySelectorAll('[data-for]').forEach(el => { el.hidden = !el.dataset.for.split(' ').includes(kind); });
   document.querySelectorAll('[data-os]').forEach(el => { el.hidden = el.dataset.os !== platform; el.disabled = el.hidden; });
   const hold = $('hold'); hold.innerHTML = '';
-  for (const [v, t] of HOLD[platform]) hold.add(new Option(t, v));
+  for (const [v, t, kinds] of HOLD[platform]) if (!kinds || kinds.includes(kind)) hold.add(new Option(t, v));
   $('drive').closest('.row').hidden = kind !== 'disk' || platform === 'mac';
   const tap = { ram: 'A tap switches between GB and %.', vram: 'A tap switches between GB and %.',
-    disk: platform === 'mac' ? 'A tap switches between used and free space.' : 'A tap cycles through activity, used space and free space.' }[kind];
+    disk: platform === 'mac' ? 'A tap switches between used and free space.' : 'A tap cycles through activity, used space and free space.',
+    net: 'A tap cycles through download, upload and both.',
+    battery: 'A tap switches between charge and time left.',
+    fps: 'A tap switches between fps and frame time. Without RivaTuner a hold opens the setup guide.' }[kind];
   $('tapHint').textContent = 'Hold for half a second to open it.' + (tap ? ' ' + tap : '');
+  const thr = THRESHOLDS[kind] || { labels:['Calm below','Red from','Glow from'], unit:'%', max:101, hint:'' };
+  ['warnLabel','critLabel','pegLabel'].forEach((id, i) => { $(id).textContent = thr.labels[i]; });
+  document.querySelectorAll('.thrUnit').forEach(el => { el.textContent = thr.unit; });
+  ['warn','crit','peg'].forEach(id => { $(id).max = thr.max; });
+  $('thrHint').textContent = thr.hint; $('thrHint').hidden = !thr.hint;
   fill();
 }
 
@@ -177,6 +249,9 @@ function save() {
 }
 
 FIELDS.forEach(f => { const el = $(f); el && el.addEventListener(el.tagName === 'SELECT' ? 'change' : 'input', save); });
+$('help').addEventListener('click', () => {
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ event: 'sendToPlugin', action, context: uuid, payload: { type: 'help' } }));
+});
 $('reset').addEventListener('click', () => {
   for (const k of ['calm','warm','hot','warn','crit','peg']) settings[k] = DEFAULTS[k];
   fill(); save();
